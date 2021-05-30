@@ -44,10 +44,11 @@ public:
         iterator& operator=(iterator&& it)
         {
             if (this != &it) {
-                buffer = std::move(it.buffer);
-                i = std::move(it.i);
-                length = std::move(it.length);
-                value_ptr = std::move(it.value_ptr);
+                using std::move;
+                buffer = move(it.buffer);
+                i = move(it.i);
+                length = move(it.length);
+                value_ptr = move(it.value_ptr);
             }
             return *this;
         }
