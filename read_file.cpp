@@ -85,21 +85,23 @@ public:
     };
 
     Inotify(const string& file, const uint32_t& mask)
-        : fd(inotify_init())
+        : fd(inotify_init1(IN_NONBLOCK))
     {
-        check_error(fd, "inotify_init");
+        check_error(fd, "inotify_init1");
         wd = inotify_add_watch(fd, file.c_str(), mask);
         check_error(wd, "inotify_add_watch");
     }
 
-    iterator wait()
+    bool is_ready()
     {
         length = read(fd, buffer, EVENT_BUF_LEN);
-        check_error(length, "read");
-        return iterator(buffer, 0, length);
+        return length >= 0;
     }
 
-    iterator begin() const = delete;
+    iterator begin()
+    {
+        return iterator(buffer, 0, length);
+    }
 
     iterator end() const
     {
@@ -122,51 +124,27 @@ private:
 mutex m;
 condition_variable cv;
 bool closed = false;
-bool got_event = false;
 bool processed = false;
-inotify_event event;
 
 void read_file()
 {
     try {
         ifstream ifs(FILE_TO_READ, ofstream::in);
         check_error(ifs.is_open() ? 0 : -1, (string("error while opening file ") + FILE_TO_READ));
-        string line;
-        while (getline(ifs, line)) {
-            cout << "Read: " << line << endl;
-        }
-        processed = true;
         std::unique_lock<std::mutex> ul(m);
-        cv.notify_one();
         while (!closed) {
-            cv.wait(ul, [] { return got_event; });
-            if (event.mask & IN_OPEN) {
-                cerr << "read_file should be opened during or after file is modified, not before" << endl;
-                closed = true;
-            } else if (event.mask & IN_MODIFY) {
-                while (getline(ifs, line)) {
-                    cout << "Read: " << line << endl;
-                }
-                ifs.clear();
-            } else if (event.mask & IN_CLOSE) {
-                closed = true;
-            } else {
-                if (event.mask & IN_ISDIR) {
-                    cout << "Directory " << event.name << " had uncatched event.\n";
-                } else {
-                    cout << "File " << event.name << " had uncatched event.\n";
-                }
+            string line;
+            while (getline(ifs, line)) {
+                cout << "Read: " << line << endl;
             }
+            ifs.clear();
             processed = true;
-            got_event = false;
             cv.notify_one();
-            check_error(ifs.bad() ? -1 : 0, (string("error while reading file ") + FILE_TO_READ));
+            cv.wait(ul, []() { return (!processed || closed); });
         }
-        ul.unlock();
         ifs.close();
     } catch (...) {
         cerr << "Error reading file" << endl;
-        closed = true;
     }
 }
 
@@ -176,17 +154,35 @@ int main()
         thread t_read(read_file);
         unique_lock<mutex> ul(m);
         cv.wait(ul, []() { return processed; });
-        processed = false;
         Inotify inotify(FILE_TO_READ, IN_MODIFY | IN_CLOSE | IN_OPEN);
-        while (!closed) {
-            for (auto it = inotify.wait(); it != inotify.end(); ++it) {
-                event = *it;
-                got_event = true;
-                processed = false;
+        bool stop_processing = false;
+        while (!stop_processing) {
+            while (!inotify.is_ready()) {
+                this_thread::sleep_for(chrono::seconds(1));
+            }
+            for (auto it = inotify.begin(); it != inotify.end(); ++it) {
+                if (it->mask & IN_OPEN) {
+                    cerr << "read_file should be opened during or after file is modified, not before" << endl;
+                    stop_processing = true;
+                } else if (it->mask & IN_MODIFY) {
+                    processed = false;
+                } else if (it->mask & IN_CLOSE) {
+                    stop_processing = true;
+                } else {
+                    if (it->mask & IN_ISDIR) {
+                        cout << "Directory " << it->name << " had uncatched event.\n";
+                    } else {
+                        cout << "File " << it->name << " had uncatched event.\n";
+                    }
+                }
                 cv.notify_one();
                 cv.wait(ul, []() { return processed; });
             }
-            cv.notify_one();
+            if (stop_processing) {
+                closed = true;
+                ul.unlock();
+                cv.notify_one();
+            }
         }
         t_read.join();
     } catch (...) {
