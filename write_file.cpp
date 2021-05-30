@@ -9,7 +9,7 @@ constexpr const char* FILE_TO_WRITE = "/tmp/somefile";
 
 int main()
 {
-    ofstream ofs(FILE_TO_WRITE, ofstream::out | ofstream::app);
+    ofstream ofs(FILE_TO_WRITE, ofstream::out | ofstream::trunc);
     int i = 0;
     while (true) {
         ++i;

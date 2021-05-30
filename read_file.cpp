@@ -1,6 +1,8 @@
+#include <condition_variable>
 #include <fstream>
 #include <iostream>
 #include <sys/inotify.h>
+#include <thread>
 #include <unistd.h>
 
 using namespace std;
@@ -22,6 +24,7 @@ public:
     class iterator {
         using value_type = inotify_event;
         using pointer = value_type*;
+        using reference = value_type&;
 
     public:
         iterator(const char* _buffer, const size_t& _i, const size_t& _length)
@@ -53,6 +56,11 @@ public:
             return *this;
         }
 
+        reference operator*()
+        {
+            return *value_ptr;
+        }
+
         pointer operator->()
         {
             return value_ptr;
@@ -78,9 +86,9 @@ public:
 
     Inotify(const string& file, const uint32_t& mask)
         : fd(inotify_init())
-        , wd(inotify_add_watch(fd, file.c_str(), mask))
     {
         check_error(fd, "inotify_init");
+        wd = inotify_add_watch(fd, file.c_str(), mask);
         check_error(wd, "inotify_add_watch");
     }
 
@@ -111,42 +119,72 @@ private:
     int length;
 };
 
+mutex m;
+condition_variable cv;
+bool closed = false;
+bool got_event = false;
+bool processed = false;
+inotify_event event;
+
+void watch_file()
+{
+    try {
+        unique_lock<mutex> ul(m);
+        Inotify inotify(FILE_TO_READ, IN_MODIFY | IN_CLOSE | IN_OPEN);
+        while (!closed) {
+            for (auto it = inotify.wait(); it != inotify.end(); ++it) {
+                event = *it;
+                got_event = true;
+                processed = false;
+                cv.notify_one();
+                cv.wait(ul, []() { return processed; });
+            }
+            cv.notify_one();
+        }
+    } catch (...) {
+        cerr << "Inotify failed to watch";
+        closed = true;
+    }
+}
+
 int main()
 {
     try {
+        thread t_inotify(watch_file);
         ifstream ifs(FILE_TO_READ, ofstream::in);
         check_error(ifs.is_open() ? 0 : -1, (string("error while opening file ") + FILE_TO_READ));
         string line;
         while (getline(ifs, line)) {
             cout << "Read: " << line << endl;
         }
-        Inotify inotify(FILE_TO_READ, IN_MODIFY | IN_CLOSE | IN_OPEN);
-        bool closed = false;
+        std::unique_lock<std::mutex> ul(m);
         while (!closed) {
-            for (auto it = inotify.wait(); it != inotify.end(); ++it) {
-                if (it->mask & IN_OPEN) {
-                    cerr << "read_file should be opened during or after file is modified, not before" << endl;
-                    closed = true;
-                    break;
-                } else if (it->mask & IN_MODIFY) {
-                    while (getline(ifs, line)) {
-                        cout << "Read: " << line << endl;
-                    }
-                    ifs.clear();
-                } else if (it->mask & IN_CLOSE) {
-                    closed = true;
-                    break;
+            cv.wait(ul, [] { return got_event; });
+            if (event.mask & IN_OPEN) {
+                cerr << "read_file should be opened during or after file is modified, not before" << endl;
+                closed = true;
+            } else if (event.mask & IN_MODIFY) {
+                while (getline(ifs, line)) {
+                    cout << "Read: " << line << endl;
+                }
+                ifs.clear();
+            } else if (event.mask & IN_CLOSE) {
+                closed = true;
+            } else {
+                if (event.mask & IN_ISDIR) {
+                    cout << "Directory " << event.name << " had uncatched event.\n";
                 } else {
-                    if (it->mask & IN_ISDIR) {
-                        cout << "Directory " << it->name << " had uncatched event.\n";
-                    } else {
-                        cout << "File " << it->name << " had uncatched event.\n";
-                    }
+                    cout << "File " << event.name << " had uncatched event.\n";
                 }
             }
+            processed = true;
+            got_event = false;
+            cv.notify_one();
             check_error(ifs.bad() ? -1 : 0, (string("error while reading file ") + FILE_TO_READ));
         }
+        ul.unlock();
         ifs.close();
+        t_inotify.join();
     } catch (...) {
         return -1;
     }
