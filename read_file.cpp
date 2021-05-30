@@ -126,38 +126,18 @@ bool got_event = false;
 bool processed = false;
 inotify_event event;
 
-void watch_file()
+void read_file()
 {
     try {
-        unique_lock<mutex> ul(m);
-        Inotify inotify(FILE_TO_READ, IN_MODIFY | IN_CLOSE | IN_OPEN);
-        while (!closed) {
-            for (auto it = inotify.wait(); it != inotify.end(); ++it) {
-                event = *it;
-                got_event = true;
-                processed = false;
-                cv.notify_one();
-                cv.wait(ul, []() { return processed; });
-            }
-            cv.notify_one();
-        }
-    } catch (...) {
-        cerr << "Inotify failed to watch";
-        closed = true;
-    }
-}
-
-int main()
-{
-    try {
-        thread t_inotify(watch_file);
         ifstream ifs(FILE_TO_READ, ofstream::in);
         check_error(ifs.is_open() ? 0 : -1, (string("error while opening file ") + FILE_TO_READ));
         string line;
         while (getline(ifs, line)) {
             cout << "Read: " << line << endl;
         }
+        processed = true;
         std::unique_lock<std::mutex> ul(m);
+        cv.notify_one();
         while (!closed) {
             cv.wait(ul, [] { return got_event; });
             if (event.mask & IN_OPEN) {
@@ -184,7 +164,31 @@ int main()
         }
         ul.unlock();
         ifs.close();
-        t_inotify.join();
+    } catch (...) {
+        cerr << "Error reading file" << endl;
+        closed = true;
+    }
+}
+
+int main()
+{
+    try {
+        thread t_read(read_file);
+        unique_lock<mutex> ul(m);
+        cv.wait(ul, []() { return processed; });
+        processed = false;
+        Inotify inotify(FILE_TO_READ, IN_MODIFY | IN_CLOSE | IN_OPEN);
+        while (!closed) {
+            for (auto it = inotify.wait(); it != inotify.end(); ++it) {
+                event = *it;
+                got_event = true;
+                processed = false;
+                cv.notify_one();
+                cv.wait(ul, []() { return processed; });
+            }
+            cv.notify_one();
+        }
+        t_read.join();
     } catch (...) {
         return -1;
     }
