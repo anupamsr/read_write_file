@@ -1,6 +1,7 @@
 #include <condition_variable>
 #include <fstream>
 #include <iostream>
+#include <sys/epoll.h>
 #include <sys/inotify.h>
 #include <thread>
 #include <unistd.h>
@@ -92,6 +93,11 @@ public:
         check_error(wd, "inotify_add_watch");
     }
 
+    int getfd() const
+    {
+        return fd;
+    }
+
     bool is_ready()
     {
         length = read(fd, buffer, EVENT_BUF_LEN);
@@ -155,11 +161,21 @@ int main()
         unique_lock<mutex> ul(m);
         cv.wait(ul, []() { return processed; });
         Inotify inotify(FILE_TO_READ, IN_MODIFY | IN_CLOSE | IN_OPEN);
+        auto ed = epoll_create(1);
+        check_error(ed, "epoll_create");
+        epoll_event ee;
+        ee.events = EPOLLIN | EPOLLET;
+        ee.data.fd = inotify.getfd();
+        check_error(epoll_ctl(ed, EPOLL_CTL_ADD, inotify.getfd(), &ee), "epoll_ctl");
         bool stop_processing = false;
         while (!stop_processing) {
-            while (!inotify.is_ready()) {
+            auto num = epoll_wait(ed, &ee, 1, 100);
+            check_error(num, "epoll_wait");
+            if (num < 1) {
                 this_thread::sleep_for(chrono::seconds(1));
+                continue;
             }
+            inotify.is_ready();
             for (auto it = inotify.begin(); it != inotify.end(); ++it) {
                 if (it->mask & IN_OPEN) {
                     cerr << "read_file should be opened during or after file is modified, not before" << endl;
@@ -184,6 +200,7 @@ int main()
                 cv.notify_one();
             }
         }
+        close(ed);
         t_read.join();
     } catch (...) {
         return -1;
